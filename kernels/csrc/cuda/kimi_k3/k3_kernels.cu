@@ -62,6 +62,12 @@ __device__ __forceinline__ float block_sum(float v, float* shm) {
 // is measurement overhead masquerading as the thing being measured. It is uploaded
 // per device by k3_prewarm_quant_tables (pre-capture, synchronous-copy-legal), so
 // the kernels read a flag that is constant for the whole run.
+// BPR14 arm selector. A __device__ global rather than a template parameter because the
+// gate/up kernel already carries five template arguments across four launch sites, and a
+// sixth would multiply every instantiation to buy an ablation. Both loop bodies are
+// compiled either way -- the specialised one is still fully unrolled -- so this only
+// chooses between them at runtime, which is what keeps the A/B on ONE binary.
+__device__ int g_k3_bpr14 = 1;
 __device__ unsigned long long g_k3_weps_skips = 0;
 __device__ int g_k3_weps_count = 0;
 
@@ -1133,10 +1139,27 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
     const Blk* u_row = up_exps   + (size_t)(e * ffn + j) * blocks_per_row;
 
     float gacc = 0.0f, uacc = 0.0f;
-    // blocks_per_row arrives as a runtime argument, so nvcc cannot unroll this and each
-    // iteration's divergent iq1s_grid_c gather sits alone on a dependent chain. Unrolling
-    // puts four independent gathers and four weight loads in flight. Accumulation order
-    // is unchanged, so this is bit-identical.
+    // BPR14: THE SAME RUNTIME-BOUND PROBLEM THE down KERNEL ALREADY FIXED, ON THE HALF
+    // THAT STREAMS TWICE THE WEIGHTS.
+    //
+    // blocks_per_row is latent/256 = 14 at K3's shape, and it arrives as a RUNTIME
+    // argument, so `#pragma unroll 4` is all nvcc can emit and only four of the
+    // divergent iq1s_grid_c gathers are ever in flight. down solved this by naming its
+    // trip count (BPR3), but gate/up was left on the capped unroll — and this is the
+    // side that issues TWO gathers per iteration, against down's one, so it has twice
+    // the independent work available to hide the same latency.
+    //
+    // A compile-time 14 puts all 28 gathers on one dependency graph. Ascending b is
+    // preserved and unrolling does not reassociate, so this is bit-identical; the
+    // runtime loop below stays for every other shape and keeps its capped unroll.
+    if (blocks_per_row == 14 && g_k3_bpr14) {
+#pragma unroll
+        for (int b = 0; b < 14; ++b) {
+            const float* xb = x + b * 256;
+            gacc += block_dot<XVEC, GPACK, GSMEM>(g_row[b], xb, lane, 32);
+            uacc += block_dot<XVEC, GPACK, GSMEM>(u_row[b], xb, lane, 32);
+        }
+    } else
 #pragma unroll 4
     for (int b = 0; b < blocks_per_row; ++b) {
         const float* xb = x + b * 256;
@@ -3800,6 +3823,14 @@ void k3_prewarm_quant_tables() {
     }();
     if (count)
         cudaMemcpyToSymbol(g_k3_weps_count, &count, sizeof(int));
+        // SPARKINFER_K3_MOE_BPR14=0 restores main's capped `#pragma unroll 4` on the
+        // gate/up trip count, on the SAME binary. Default ON: the harness scores a
+        // default build, and an env-gated win scores as zero.
+        {
+            const char* e = std::getenv("SPARKINFER_K3_MOE_BPR14");
+            const int on = (e && e[0] == '0') ? 0 : 1;
+            cudaMemcpyToSymbol(g_k3_bpr14, &on, sizeof(int));
+        }
 }
 
 // Bind the depth gate on the CURRENT device. Called from state init, with the
